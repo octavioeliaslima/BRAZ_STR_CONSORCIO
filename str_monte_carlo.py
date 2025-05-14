@@ -24,6 +24,7 @@ unnecessary.
 from typing import Dict, List, Tuple
 import pandas as pd
 import numpy as np
+import numpy_financial as nf
 
 pd.set_option("display.max_rows", 1000)
 pd.set_option("display.max_columns", 30)
@@ -45,6 +46,11 @@ class STRAnalyzer:
     def __init__(self, params: Dict):
         self.base_params: Dict = params.copy()   # immutable reference for MC runs
         self.params: Dict      = params.copy()   # mutable working copy
+        # ----- Exit‑strategy defaults -------------------------------------
+        # Default: assume 4 % nominal appreciation per year if no value passed
+        self.params.setdefault("exit_appreciation_rate", 0.04)
+        # Discount‑rate default for NPV calculations (annual, decimal)
+        self.params.setdefault("discount_rate_annual", 0.10)
         self._derive_properties()                # build property‑level stubs
 
         # ----- Bid schedule creation ----------------------------------
@@ -127,7 +133,11 @@ class STRAnalyzer:
     def _build_monthly_df(self) -> pd.DataFrame:
         p          = self.params
         red_pct    = p["parcela_redutora_pct"]
-        dates      = pd.date_range("2025-06-01", periods=p["term_months"], freq="MS")
+        # Extend projection horizon by 5 years beyond the loan term
+        projection_months = p["term_months"] + 5 * 12
+        # Total number of years in the full projection horizon
+        projection_years = projection_months / 12
+        dates      = pd.date_range("2025-06-01", periods=projection_months, freq="MS")
         start_year = dates[0].year
         rows: List[Dict] = []
 
@@ -211,13 +221,27 @@ class STRAnalyzer:
                     adj_factor  = (1 - embed) / (1 - embed / n_props)
                     principal_brl += principal_per_prop * adj_factor + catchup_brl_per_prop[i]
 
-            inst_usd = (principal_brl + admin_brl + seguro_brl) / p["exchange_rate"]
+            # No installments after loan term
+            if idx > p["term_months"]:
+                inst_usd = 0.0
+            else:
+                inst_usd = (principal_brl + admin_brl + seguro_brl) / p["exchange_rate"]
 
             daily_rate_usd, rev_usd, admin_usd = self._compute_revenue_metrics(
                 revenue_props, year_idx, month_idx
             )
 
             cf_month = rev_usd - (inst_usd + admin_usd)
+            # ---------------------------------------------------------------
+            # Exit strategy — add sale proceeds in the final projection month
+            # ---------------------------------------------------------------
+            sale_usd = 0.0
+            if idx == projection_months:  # 2045‑05‑01 for the default start date
+                exit_rate   = p.get("exit_appreciation_rate", 0.04)
+                sale_factor = (1 + exit_rate) ** projection_years
+                sale_brl    = credit_total_orig * sale_factor
+                sale_usd    = sale_brl / p["exchange_rate"]
+                cf_month   += sale_usd
 
             embed_vals = [prop["embed_at_cont"] for prop in self.properties if prop["cont_month"] == idx]
             embed_str  = ", ".join(f"{int(v * 100)}%" for v in embed_vals) if embed_vals else 0
@@ -232,8 +256,9 @@ class STRAnalyzer:
                 "STR Daily Rate":     daily_rate_usd,
                 "Mo. Gross Revenue":  rev_usd,
                 "Airbnb Admin Fee":   admin_usd,
-                "STR Mo. Profit":     rev_usd - admin_usd,
+                "STR Mo. Profit":     rev_usd - (admin_usd + inst_usd),
                 "Mo. Cash Flow":      cf_month,
+                "Exit Proceeds USD":  sale_usd,
             })
 
             for prop in self.properties:
@@ -303,7 +328,7 @@ class STRAnalyzer:
         Logic was extracted from `run_monte_carlo` to keep that method lean.
         """
         p = self.base_params.copy()
-        p["occupancy_rate"] = np.random.beta(6, 4)
+        p["occupancy_rate"] = np.random.beta(4, 4)
 
         base_daily = self.base_params["daily_rate_factor"]
         p["daily_rate_factor"] = max(
@@ -312,7 +337,7 @@ class STRAnalyzer:
 
         base_ex = self.base_params["exchange_rate"]
         p["exchange_rate"] = max(
-            0.001, np.random.normal(base_ex, base_ex * 0.05)
+            0.001, np.random.normal(base_ex, base_ex * 0.12)
         )
 
         p["monthly_nights"] = int(np.random.uniform(24, 28))
@@ -381,7 +406,7 @@ class STRAnalyzer:
     # Percentiles of both free cash flow and cumulative credit granted are
     # returned as two DataFrames, indexed by Year.
     # ------------------------------------------------------------------
-    def run_monte_carlo(self, runs: int = 1000, percentiles: List[int] = [5, 25, 50, 75, 95]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    def run_monte_carlo(self, runs: int = 1000, percentiles: List[int] = [5, 25, 50, 75, 95]) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         """Monte-Carlo wrapper around :py:meth:`run`.
 
         The probability distributions mirror empirical STR data from major
@@ -389,6 +414,9 @@ class STRAnalyzer:
         parameterised by the caller.
         """
         sim_flows, sim_credit, years = [], [], None
+        irr_vals, npv_vals = [], []
+        disc_rate_annual   = self.params.get("discount_rate_annual", 0.10)
+        disc_rate_monthly  = (1 + disc_rate_annual) ** (1 / 12) - 1
         for _ in range(runs):
             p = self._randomize_run_params()
 
@@ -400,6 +428,23 @@ class STRAnalyzer:
             if years is None:
                 years = annual_df["Year"].values
 
+            # ---- IRR & NPV for this run -----------------------------------
+            cash_flows = monthly_df["Mo. Cash Flow USD"].astype(float).values
+            try:
+                irr_monthly = nf.irr(cash_flows)
+                if np.isnan(irr_monthly):
+                    irr_annual = np.nan
+                else:
+                    irr_annual = (1 + irr_monthly) ** 12 - 1
+            except Exception:
+                irr_annual = np.nan
+            irr_vals.append(irr_annual)
+
+            npv_val = np.sum(
+                cash_flows / (1 + disc_rate_monthly) ** np.arange(cash_flows.size)
+            )
+            npv_vals.append(npv_val)
+
         flow_matrix   = np.vstack(sim_flows)
         credit_matrix = np.vstack(sim_credit)
         pct_flow_df   = pd.DataFrame(index=years, columns=[f"P{p}" for p in percentiles])
@@ -410,7 +455,19 @@ class STRAnalyzer:
                 pct_flow_df.loc[yr, f"P{pctl}"]   = np.percentile(flow_data, pctl)
                 pct_credit_df.loc[yr, f"P{pctl}"] = np.percentile(credit_data, pctl)
         pct_flow_df.index.name = pct_credit_df.index.name = "Year"
-        return pct_flow_df.astype(int), pct_credit_df.astype(int)
+
+        # ---- Build IRR & NPV percentile DataFrame ------------------------
+        irr_npv_df = pd.DataFrame(index=["NPV USD", "Annual IRR"],
+                                  columns=[f"P{p}" for p in percentiles])
+        irr_array, npv_array = np.array(irr_vals), np.array(npv_vals)
+        for pctl in percentiles:
+            irr_npv_df.loc["NPV USD",   f"P{pctl}"] = np.percentile(npv_array,  pctl)
+            irr_npv_df.loc["Annual IRR", f"P{pctl}"] = np.nanpercentile(irr_array * 100, pctl)
+        # Round NPV to 0 decimals (integer) and IRR to 1 decimal
+        irr_npv_df.loc["NPV USD"]      = irr_npv_df.loc["NPV USD"].round(0).astype(int)
+        irr_npv_df.loc["Annual IRR"]   = irr_npv_df.loc["Annual IRR"].round(0).astype(int)
+
+        return pct_flow_df.astype(int), pct_credit_df.astype(int), irr_npv_df
 
 
 # ----------------------------------------------------------------------
@@ -437,16 +494,20 @@ if __name__ == "__main__":
     }
     analyzer = STRAnalyzer(params)
     annual_df, monthly_df = analyzer.run()
-    print("#" * 195)
+    print("#" * 200)
 
     print("Deterministic Annual Summary:\n", annual_df) 
-    print("#" * 195)
+    print("#" * 200)
 
     print("Deterministic Monthly Summary:\n", monthly_df)
-    print("#" * 195)
+    print("#" * 200)
 
-    mc_flow_pct, mc_credit_pct = analyzer.run_monte_carlo(runs=1000)
+    mc_flow_pct, mc_credit_pct, mc_val_pct = analyzer.run_monte_carlo(runs=1000)
     print("Monte Carlo Percentiles of Annual Flow USD by Year (1,000 runs):\n", mc_flow_pct)
-    print("#" * 195)
+    print("#" * 200)
     
     print("Monte Carlo Percentiles of Cumulative Credit Granted BRL by Year (1,000 runs):\n", mc_credit_pct)
+    print("#" * 200)
+
+    print("Monte Carlo Percentiles of NPV & Annual IRR (1,000 runs):\n", mc_val_pct)
+    print("#" * 200)
